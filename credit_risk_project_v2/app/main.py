@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import Optional
 
 import joblib
+import numpy as np
 import pandas as pd
+import shap
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 ARTIFACT_DIR = Path(__file__).resolve().parent.parent / "artifacts"
@@ -20,6 +23,19 @@ app = FastAPI(
     title="India Credit Risk Cascade API",
     description="Model 1 (default probability) -> Model 2 (loan grade) -> Model 3 (interest rate)",
     version="0.1.0",
+)
+
+# Allow browser-based frontends (your dummy test page, and later your real
+# React dashboard) to call this API from a different origin. Wide open here
+# since this is a student project behind no auth yet; tighten allow_origins
+# to your actual frontend's domain once you have one, e.g.
+# ["https://your-frontend.vercel.app"] instead of "*".
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
@@ -44,6 +60,56 @@ NUMERIC_FEATURES = [
     "upi_txn_freq_monthly", "upi_txn_volatility", "gst_compliance_score",
     "sector_risk_score",
 ]
+
+# ---------------------------------------------------------------------------
+# SHAP explainability (Model 1 -- "why this default risk assessment")
+# ---------------------------------------------------------------------------
+# TreeExplainer reads the tree structure directly -- fast and exact for
+# HistGradientBoostingClassifier, no extra background dataset needed.
+_shap_explainer = shap.TreeExplainer(model1.named_steps["clf"])
+
+
+def _map_to_original_feature(transformed_name: str) -> str:
+    """Map a post-preprocessing column name (e.g. 'cat__state_Maharashtra',
+    'num__missingindicator_cibil_score') back to the original applicant
+    field name, so SHAP output is readable without knowing the pipeline
+    internals."""
+    if transformed_name.startswith("num__missingindicator_"):
+        return transformed_name.replace("num__missingindicator_", "") + " (missing?)"
+    if transformed_name.startswith("num__"):
+        return transformed_name.replace("num__", "")
+    if transformed_name.startswith("cat__"):
+        rest = transformed_name.replace("cat__", "")
+        for col in CATEGORICAL_FEATURES:
+            if rest.startswith(col + "_"):
+                return col
+        return rest
+    return transformed_name
+
+
+def explain_default_risk(applicant_df: pd.DataFrame, top_n: int = 5):
+    """Returns the top_n features driving Model 1's default-probability
+    prediction for this one applicant, as signed contributions.
+    Positive impact = pushed default risk UP. Negative = pushed it DOWN."""
+    pre = model1.named_steps["pre"]
+    X_transformed = pre.transform(applicant_df[CATEGORICAL_FEATURES + NUMERIC_FEATURES])
+    feature_names = list(pre.get_feature_names_out())
+
+    shap_values = _shap_explainer.shap_values(X_transformed)
+    # Different shap/sklearn version combos return either a list of arrays
+    # (one per class) or a single array for the positive class -- handle both.
+    if isinstance(shap_values, list):
+        row_values = shap_values[1][0]
+    else:
+        row_values = np.asarray(shap_values)[0]
+
+    grouped = {}
+    for name, val in zip(feature_names, row_values):
+        original = _map_to_original_feature(name)
+        grouped[original] = grouped.get(original, 0.0) + float(val)
+
+    top_factors = sorted(grouped.items(), key=lambda kv: abs(kv[1]), reverse=True)[:top_n]
+    return [{"feature": f, "impact": round(v, 4)} for f, v in top_factors]
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +168,15 @@ class PredictionResponse(BaseModel):
     loan_grade: str
     grade_probabilities: dict
     interest_rate_pct: float
+    credit_risk_score: int
+    expected_roi_pct: float
+
+
+# CIBIL-style scale: 300 + 600 x (1 - default_probability) x grade_weight.
+# grade_weight is a placeholder monotonic decay (A best, E worst) -- swap in
+# your report's Section 8 values here if they specify exact numbers.
+GRADE_WEIGHT = {"A": 1.0, "B": 0.85, "C": 0.7, "D": 0.55, "E": 0.4}
+COST_OF_CAPITAL_PCT = 7.0  # subtracted from expected ROI
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +185,24 @@ class PredictionResponse(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+class ExplainResponse(BaseModel):
+    top_factors: list
+
+
+@app.post("/explain", response_model=ExplainResponse)
+def explain(applicant: ApplicantRequest):
+    """Returns the top factors driving this applicant's default-risk score.
+    'impact' > 0 means that feature pushed risk UP; < 0 means it pushed
+    risk DOWN. Frontend just needs to render this as a bar list -- no SHAP
+    knowledge required on that side."""
+    try:
+        X_base = applicant.to_dataframe()
+        factors = explain_default_risk(X_base)
+        return ExplainResponse(top_factors=factors)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -137,11 +230,20 @@ def predict(applicant: ApplicantRequest):
         )
         rate_pred = float(model3.predict(X_m3[m3_cols])[0])
 
+        # Derived, non-ML fields -- pure formulas on top of the 3 model
+        # outputs above, per the dataset's data dictionary (Sec 8).
+        credit_risk_score = round(
+            300 + 600 * (1 - default_proba) * GRADE_WEIGHT[grade_pred]
+        )
+        expected_roi_pct = rate_pred * (1 - default_proba) - COST_OF_CAPITAL_PCT
+
         return PredictionResponse(
             default_probability=round(default_proba, 4),
             loan_grade=grade_pred,
             grade_probabilities={k: round(v, 4) for k, v in grade_proba_dict.items()},
             interest_rate_pct=round(rate_pred, 2),
+            credit_risk_score=credit_risk_score,
+            expected_roi_pct=round(expected_roi_pct, 2),
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
