@@ -17,6 +17,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+# Panel 5 agent layer
+from P5_LLM import explainer_agent, negotiation_agent, compliance_agent
+
 ARTIFACT_DIR = Path(__file__).resolve().parent.parent / "artifacts"
 
 app = FastAPI(
@@ -25,11 +28,6 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Allow browser-based frontends (your dummy test page, and later your real
-# React dashboard) to call this API from a different origin. Wide open here
-# since this is a student project behind no auth yet; tighten allow_origins
-# to your actual frontend's domain once you have one, e.g.
-# ["https://your-frontend.vercel.app"] instead of "*".
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -64,16 +62,10 @@ NUMERIC_FEATURES = [
 # ---------------------------------------------------------------------------
 # SHAP explainability (Model 1 -- "why this default risk assessment")
 # ---------------------------------------------------------------------------
-# TreeExplainer reads the tree structure directly -- fast and exact for
-# HistGradientBoostingClassifier, no extra background dataset needed.
 _shap_explainer = shap.TreeExplainer(model1.named_steps["clf"])
 
 
 def _map_to_original_feature(transformed_name: str) -> str:
-    """Map a post-preprocessing column name (e.g. 'cat__state_Maharashtra',
-    'num__missingindicator_cibil_score') back to the original applicant
-    field name, so SHAP output is readable without knowing the pipeline
-    internals."""
     if transformed_name.startswith("num__missingindicator_"):
         return transformed_name.replace("num__missingindicator_", "") + " (missing?)"
     if transformed_name.startswith("num__"):
@@ -88,16 +80,11 @@ def _map_to_original_feature(transformed_name: str) -> str:
 
 
 def explain_default_risk(applicant_df: pd.DataFrame, top_n: int = 5):
-    """Returns the top_n features driving Model 1's default-probability
-    prediction for this one applicant, as signed contributions.
-    Positive impact = pushed default risk UP. Negative = pushed it DOWN."""
     pre = model1.named_steps["pre"]
     X_transformed = pre.transform(applicant_df[CATEGORICAL_FEATURES + NUMERIC_FEATURES])
     feature_names = list(pre.get_feature_names_out())
 
     shap_values = _shap_explainer.shap_values(X_transformed)
-    # Different shap/sklearn version combos return either a list of arrays
-    # (one per class) or a single array for the positive class -- handle both.
     if isinstance(shap_values, list):
         row_values = shap_values[1][0]
     else:
@@ -151,9 +138,6 @@ class ApplicantRequest(BaseModel):
 
     def to_dataframe(self) -> pd.DataFrame:
         data = self.dict()
-        # Derive fields the caller didn't supply, using the same formulas
-        # as the dataset's data dictionary, so the API is usable with a
-        # minimal payload.
         if data["loan_to_income_ratio"] is None:
             data["loan_to_income_ratio"] = data["loan_amount_requested"] / (
                 data["monthly_income"] * 12
@@ -172,11 +156,59 @@ class PredictionResponse(BaseModel):
     expected_roi_pct: float
 
 
-# CIBIL-style scale: 300 + 600 x (1 - default_probability) x grade_weight.
-# grade_weight is a placeholder monotonic decay (A best, E worst) -- swap in
-# your report's Section 8 values here if they specify exact numbers.
 GRADE_WEIGHT = {"A": 1.0, "B": 0.85, "C": 0.7, "D": 0.55, "E": 0.4}
-COST_OF_CAPITAL_PCT = 7.0  # subtracted from expected ROI
+COST_OF_CAPITAL_PCT = 7.0
+
+
+# ---------------------------------------------------------------------------
+# Underwriting agent (Agent 1) — the cascade as one reusable function.
+# Takes a plain dict, returns the decision dict. Used by /predict AND by the
+# negotiation agent (which re-runs it on a modified profile).
+# ---------------------------------------------------------------------------
+def run_cascade(profile: dict) -> dict:
+    applicant = ApplicantRequest(**profile)
+    X_base = applicant.to_dataframe()
+
+    # Model 1: default probability
+    default_proba = float(
+        model1.predict_proba(X_base[CATEGORICAL_FEATURES + NUMERIC_FEATURES])[0, 1]
+    )
+
+    # Model 2: loan grade (needs Model 1's output as an extra feature)
+    X_m2 = X_base.copy()
+    X_m2["default_proba"] = default_proba
+    grade_pred = model2.predict(
+        X_m2[CATEGORICAL_FEATURES + NUMERIC_FEATURES + ["default_proba"]]
+    )[0]
+    grade_proba = model2.predict_proba(
+        X_m2[CATEGORICAL_FEATURES + NUMERIC_FEATURES + ["default_proba"]]
+    )[0]
+    grade_proba_dict = {cls: float(p) for cls, p in zip(GRADE_CLASSES, grade_proba)}
+
+    # Model 3: interest rate (needs Model 1 + Model 2 outputs as features)
+    X_m3 = X_m2.copy()
+    for cls, p in grade_proba_dict.items():
+        X_m3[f"grade_proba_{cls}"] = p
+    m3_cols = (
+        CATEGORICAL_FEATURES + NUMERIC_FEATURES + ["default_proba"]
+        + [f"grade_proba_{c}" for c in GRADE_CLASSES]
+    )
+    rate_pred = float(model3.predict(X_m3[m3_cols])[0])
+
+    # Derived formulas
+    credit_risk_score = round(
+        300 + 600 * (1 - default_proba) * GRADE_WEIGHT[grade_pred]
+    )
+    expected_roi_pct = rate_pred * (1 - default_proba) - COST_OF_CAPITAL_PCT
+
+    return {
+        "default_probability": round(default_proba, 4),
+        "loan_grade": grade_pred,
+        "grade_probabilities": {k: round(v, 4) for k, v in grade_proba_dict.items()},
+        "interest_rate_pct": round(rate_pred, 2),
+        "credit_risk_score": credit_risk_score,
+        "expected_roi_pct": round(expected_roi_pct, 2),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -193,10 +225,6 @@ class ExplainResponse(BaseModel):
 
 @app.post("/explain", response_model=ExplainResponse)
 def explain(applicant: ApplicantRequest):
-    """Returns the top factors driving this applicant's default-risk score.
-    'impact' > 0 means that feature pushed risk UP; < 0 means it pushed
-    risk DOWN. Frontend just needs to render this as a bar list -- no SHAP
-    knowledge required on that side."""
     try:
         X_base = applicant.to_dataframe()
         factors = explain_default_risk(X_base)
@@ -208,42 +236,44 @@ def explain(applicant: ApplicantRequest):
 @app.post("/predict", response_model=PredictionResponse)
 def predict(applicant: ApplicantRequest):
     try:
-        X_base = applicant.to_dataframe()
-
-        # Model 1: default probability
-        default_proba = float(model1.predict_proba(X_base[CATEGORICAL_FEATURES + NUMERIC_FEATURES])[0, 1])
-
-        # Model 2: loan grade (needs Model 1's output as an extra feature)
-        X_m2 = X_base.copy()
-        X_m2["default_proba"] = default_proba
-        grade_pred = model2.predict(X_m2[CATEGORICAL_FEATURES + NUMERIC_FEATURES + ["default_proba"]])[0]
-        grade_proba = model2.predict_proba(X_m2[CATEGORICAL_FEATURES + NUMERIC_FEATURES + ["default_proba"]])[0]
-        grade_proba_dict = {cls: float(p) for cls, p in zip(GRADE_CLASSES, grade_proba)}
-
-        # Model 3: interest rate (needs Model 1 + Model 2 outputs as features)
-        X_m3 = X_m2.copy()
-        for cls, p in grade_proba_dict.items():
-            X_m3[f"grade_proba_{cls}"] = p
-        m3_cols = (
-            CATEGORICAL_FEATURES + NUMERIC_FEATURES + ["default_proba"]
-            + [f"grade_proba_{c}" for c in GRADE_CLASSES]
-        )
-        rate_pred = float(model3.predict(X_m3[m3_cols])[0])
-
-        # Derived, non-ML fields -- pure formulas on top of the 3 model
-        # outputs above, per the dataset's data dictionary (Sec 8).
-        credit_risk_score = round(
-            300 + 600 * (1 - default_proba) * GRADE_WEIGHT[grade_pred]
-        )
-        expected_roi_pct = rate_pred * (1 - default_proba) - COST_OF_CAPITAL_PCT
-
-        return PredictionResponse(
-            default_probability=round(default_proba, 4),
-            loan_grade=grade_pred,
-            grade_probabilities={k: round(v, 4) for k, v in grade_proba_dict.items()},
-            interest_rate_pct=round(rate_pred, 2),
-            credit_risk_score=credit_risk_score,
-            expected_roi_pct=round(expected_roi_pct, 2),
-        )
+        return PredictionResponse(**run_cascade(applicant.dict()))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Panel 5 — agent routes
+# ---------------------------------------------------------------------------
+class AgentQuery(BaseModel):
+    question: str = ""
+    profile: dict
+    decision: dict
+
+
+@app.post("/agent/ask")
+def agent_ask(q: AgentQuery):
+    try:
+        return {"agent": "Explainer agent",
+                "answer": explainer_agent(q.question, q.profile, q.decision)}
+    except Exception:
+        return {"agent": "System",
+                "answer": "The explainer is temporarily unavailable — your decision above is unaffected."}
+
+
+@app.post("/agent/negotiate")
+def agent_negotiate(q: AgentQuery):
+    try:
+        res = negotiation_agent(q.question, q.profile, q.decision, run_cascade)
+        return {"agent": "Negotiation agent", "answer": res["answer"],
+                "changes": res["changes"], "new_decision": res["new_decision"]}
+    except Exception:
+        return {"agent": "System",
+                "answer": "Couldn't process that proposal — try 'what if my EMI were 5,000 lower?'"}
+
+
+@app.post("/agent/compliance")
+def agent_compliance(q: AgentQuery):
+    try:
+        return {"agent": "Compliance agent", **compliance_agent(q.decision, q.profile)}
+    except Exception:
+        return {"agent": "System", "flag": False, "reason": "Compliance check unavailable.", "cited_text": ""}
